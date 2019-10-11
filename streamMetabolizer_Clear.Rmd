@@ -1,9 +1,11 @@
 ---
-title: "02_StreamMetabolizer_COMO"
+title: "StreamMetabolizer_Clear"
 author: "Alex Brooks, modified by Isabella Oleksy and Karin Emanuelson"
 date: "April 4, 2019"
-output: html_document
-editor_options: 
+output:
+  pdf_document: default
+  html_document: default
+editor_options:
   chunk_output_type: console
 ---
 
@@ -14,94 +16,145 @@ library(streamMetabolizer)
 library(dplyr)
 library(tidyverse)
 library(lubridate)
+library(ggthemes)
+library(dygraphs)
+library(xts)
+library(unitted)
 
 ?mm_data
 ## ^^ Information on how to prep your data, including what units.
-##For example, I learned that if you don't have DO saturation data,
-#you can calculate using the calc_DO_sat() function
+
 
 #What is the required data format to run the bayes model?
 # metab_inputs('night', 'data')
 # metab_inputs('mle', 'data')
 metab_inputs('bayes', 'data')
-#requires depth, which we do not have for The Loch. We can use this model for
-#the NSV/Beaver Meadow dataset, however. There is a handy calc_depth() function too...
-# ?calc_depth
+
 ```
 
 #Load Data from different loggers and merge into data file
 ```{r}
 #Load raw DO data from 850 Site
-DO.raw<- read_csv('data/in/CR1000_CZO4_1454_PB3_Data_Turb_Lvl_CDOM_CleanR.csv')%>%
+Data.raw<- read_csv('data/in/CR1000_CZO4_1454_PB3_Data_Turb_Lvl_CDOM_CleanR.csv')%>%
   ##you'll need to change directory specific to your computer
-  mutate(UTC= mdy_hms(datetime, tz='UTC'))%>%
+  mutate(UTC= mdy_hms(UTC, tz='UTC'))%>%
   mutate(datetime= mdy_hms(datetime, tz='CST6cDT'))%>%
   mutate(depth = PT_depth_adj*.01)%>%
+  mutate(discharge = discharge/1000)%>%
   # select data from Continuous dataset
   select(datetime, UTC, DO.obs=DO_Conc, DO.per=DO_Per, temp.water=WTemp,depth, discharge, qal = Q)%>%
   filter(!is.na(DO.obs))
 
+#Load light data from 850
 Light.raw<-read_csv('data/in/20363875_PAR_850.csv', skip = 1)%>%
   mutate(datetime= mdy_hms(datetime, tz='CST6cDT'))%>%
   mutate(light=I_Lux*0.0185)%>%
   select(datetime, light)
 
+#Load pressure data from 850, convert kPA to mb
 Press.raw<-read_csv('data/in/20341764_baro.csv', skip = 1)%>%
   mutate(datetime= mdy_hms(datetime, tz='CST6cDT'))%>%
   mutate(pressure.air=Abs_Pres_kPa*10)%>%
   select(datetime, pressure.air)
          
-         
+#Merge data into one file
+raw1<-left_join(Data.raw, Light.raw, by= "datetime")
+DO.raw<-left_join(raw1, Press.raw, by= "datetime")
+
 
 #Need to Calculate Percent Saturation 
-library(unitted)
 DO.raw$DO.sat<-calc_DO_sat(temp.water=u(DO.raw$temp.water,"degC"), pressure.air=u(DO.raw$pressure.air, "mb"), salinity.water = u(0, "PSU"), model = "garcia-benson")
 
 #Calculate Percent as a check
 DO.raw<-DO.raw%>%
-  mutate(DO.per= DO.obs/DO.sat*100)%>%
+  mutate(DO.per2= DO.obs/DO.sat*100)%>%
   mutate(date= date(datetime))
+
+#Plot DO.per from miniDOT to calculated DO.Per from DO.sat
+# ggplot(DO.raw,aes(x=DO.per,y=as.numeric(DO.per2))) + 
+#   geom_point()+
+#   theme_few() + 
+#   scale_color_few() +
+#   theme(legend.position=c(0.2,0.8))
 #Look at structure of the data
-str(DO.raw)
-
-stage.Raw<- read.csv('C:/Users/keman/Dropbox/Documents/Courses/Metabolism ECO 592/Metabolizer/COMO/input/Como_Stage_250m_STR_10min_m3s.csv')%>%
-  mutate(datetime= mdy_hms(datetime, tz='MST7MDT'))%>%
-  select(datetime, CorrStage, Discharge)
-#Look at structure of the data
-str(stage.Raw)
-
-#Join the two datasets together
-DO.raw<- left_join(DO.raw,stage.Raw)
-
-
+# str(DO.raw)
 ```
 
+# Get solar time
 ```{r}
-####EVERYONE RUN THIS CHUNK OF CODE.####
-####No changes necessary. ##############
-
 #Using functions provided with streamMetabolizer package
-#to calculate solar time and light.
-# (posix.time.solar <- streamMetabolizer::calc_solar_time(posix.time.localtz, longitude=-106.3))
-DO.final_all<- DO.raw%>%
-  mutate(solar.time= calc_solar_time(datetime,longitude = -105.541628))%>%
-  # mutate(solar.time= mdy_hms(solartime, tz='MST7MDT'))%>%
-  mutate(depth = as.numeric(CorrStage))%>%
-  mutate(discharge = as.numeric(Discharge))%>%
-  select(solar.time, DO.obs,DO.sat,depth,temp.water,light, discharge)
+#to calculate solar time
+
+DO.final<- DO.raw%>%
+  mutate(solartime= calc_solar_time(datetime,longitude = -91.948889))%>%
+  mutate(solar.time= ymd_hms(solartime, tz='CST6CDT'))%>%
+  # mutate(depth = as.numeric(CorrStage))%>%
+  # mutate(discharge = as.numeric(Discharge))%>%
+  select(solar.time, date, DO.obs,DO.sat,depth,temp.water,light, discharge)
+
+```
+
+#Model light in order to fill in missing PAR values
+```{r}
+#Calculate the max light each day then take the mean and median value for use in calc_light function
+Max_light<- DO.final%>%
+  group_by(date)%>%
+  mutate(daily_max = max(light))%>%
+  distinct(date, .keep_all = TRUE)%>%
+  filter(!is.na(daily_max))
+
+median(Max_light$daily_max)
+mean(Max_light$daily_max)
+#based on looking at a graph of the measured light data, decieded to use mean Max Light in calc_light function
+
+#Use built in function to calculate model light for each day (in which data was not collected), Need to trick calc_light function into thinking time is UTC
+stime<-DO.final%>%
+    filter(is.na(light))%>%
+    mutate(solar.time= ymd_hms(solar.time, tz='UTC'))%>%
+    select(solar.time)
+
+tz(stime$solar.time)
+
+light<-calc_light(stime$solar.time, 41.734982, -91.948889, max.PAR= u(4066.921, "umol m^-2 s^-1"))
+
+added_light<-data.frame(stime$solar.time, light)
+tz(added_light$stime.solar.time)
+
+added_light_C<-added_light%>%
+  mutate(solar.time= ymd_hms(stime.solar.time, tz='CST6CDT'))%>%
+  select(solar.time,light)
+
+tz(added_light_C$solar.time)
+
+#graph modelled light
+#just look at 
+light_mod.xts<- xts(select(added_light_C, light), order.by = added_light_C$solar.time)
+
+
+# #plot as dygraph
+dygraph(light_mod.xts)%>%
+          dyRangeSelector()
+##### ISSUE! Light begins at the correct time but it does not end at the correct time Check Sunrise/Sunset here: https://www.timeanddate.com/sun/@4862040
+
+# merge modelled light data into DO.final dataframe then create light with continuous dataset
+DO.final.merge<-left_join(DO.final, added_light_C, by= "solar.time")
+
+DO.final.all<-DO.final.merge%>%
+  mutate(light=ifelse(is.na(light.x),light.y, light.x))
+
 ```
 
 ```{r}
-#Plot
-ggplot(DO.final,aes(x=solar.time, y=DO.sat))+
-  geom_point(size=3)+
-  geom_line(size=2)
-DO.raw<- DO.raw%>%
-  mutate(DO.per=as.numeric(DO.per))
-library(xts)
-library(dygraphs)
-DO.xts<- xts(select(DO.raw, datetime, temp.water), order.by=DO.raw$datetime)
-dygraph(DO.xts)
+#just look at 
+RAWALL.xts<- xts(select(DO.final.all, light, temp.water, DO.obs, DO.sat), order.by = DO.final$solar.time)
+
+# #plot as dygraph
+dygraph(RAWALL.xts)%>%
+          dyRangeSelector()
+
+DO.final<-select(DO.final.all, solar.time, date, DO.obs, DO.sat, depth, temp.water, discharge, light)
+
+write.csv(DO.final, file = 'C:/Users/keman/Dropbox/NSF Hydro Sci NM CO/Clear Creek 2019/CSU Crew/Dataloggers/Continuous/CZO4_DO_for_input.csv')
 ```
 
 #Run for Site
@@ -110,21 +163,27 @@ dygraph(DO.xts)
 ######TRIM DATA#######
 ######################
 
-#The following chunk of code filters DO.final_all to only include NSV_MC3 (outflow), 
-#removes any NAs, and selects July 2018 for the range of dates.
-#Here, you need to change the site name and object name according to your assignment
-#Karin, Allie, Jemma = MC2 (inflow)
-#Bella, Caitlin, Tim = MC3 (outflow)
-DO.final<- DO.final_all%>%
+#The following chunk of code filters DO.final_all 
+#removes any NAs, and selects July 2019 for the range of dates.
+
+DO.final_1<- DO.final%>%
+  filter(!is.na(depth))%>%
   filter(!is.na(solar.time))%>%
   arrange(solar.time)%>%
-  # mutate(soalr.time= mdy_hms(datetime, tz='MST7MSDT'))%>%
+  mutate(solar.time= ymd_hms(solar.time, tz='UTC'))%>%
   distinct()%>%
+  select(-date)%>%
   #filter(year(solar.time) != 2017)%>%
-  filter(date(solar.time) > mdy('6/24/18') & date(solar.time) < mdy('6/28/18'))
+  filter(date(solar.time) > mdy('7/2/19') & date(solar.time) < mdy('7/17/19'))
+#Plot
+ggplot(DO.final_1,aes(x=solar.time, y=light))+
+  geom_point(size=3)+
+  geom_line(size=2)
+# DO.raw<- DO.raw%>%
+
 
 #Get time zone attribute
-attr(DO.final$solar.time, "tzone")
+attr(DO.final_1$solar.time, "tzone")
 
 ######################################
 ######CHOOSE MODEL & PARAMETERS#######
@@ -134,9 +193,10 @@ attr(DO.final$solar.time, "tzone")
 #Then change the object name accordingly: e.g., MODELTYPE_name
 bayes_name <- mm_name(type='bayes', pool_K600='binned', err_obs_iid=TRUE, err_proc_iid=TRUE)
 
+
 ### SPECIFICATIONS: We now pass the model name to specs() to get a list of default #specifications for this model.
 #Don't change parameters, but change the object name accordingly: e.g., MODELTYPE_specs
-bayes_specs <- streamMetabolizer::specs(bayes_name, burnin_steps=2000, saved_steps=1000, n_cores=1)
+bayes_specs <- streamMetabolizer::specs(bayes_name, burnin_steps=200, saved_steps=100, n_cores=1)
 
 
 #############################
@@ -145,42 +205,43 @@ bayes_specs <- streamMetabolizer::specs(bayes_name, burnin_steps=2000, saved_ste
 #Took 13 minutes on my machine with just a week of data.
 #Change spec type and make sure data type is correct.
 #Change name: e.g., metab.MODEL.SITECODE.SITENAME.DATES
-metab.bayes.como.inj1 <- metab(bayes_specs, data=DO.final)
+metab.bayes.clear.july <- metab(bayes_specs, data=DO.final_1)
+metab.bayes.clear.july
 
+# metab.bayes.clear.july.summary <- metab.bayes.clear.july %>%
+#   mutate(Date = date(solar.time)) %>%
+#   group_by(Date)%>%
+#   summarize(n=n())
 
-metab.bayes.como.inj1.summary <- metab.bayes.como.inj1 %>%
-  mutate(DOY = yday(solar.time)) %>%
-  group_by(DOY)%>%
-  summarize(n=n())
 #NOTE:  Once you’ve fit a model, you can inspect the output with functions
 #including predict_metab() and plot_metab_preds(), predict_DO()
 #and plot_DO_preds(), get_params(), and get_fit().
 
 ###PREDICTIONS: Here are the daily metabolism predictions from the model:
-metab.bayes.como.inj1.predict<- predict_metab(metab.bayes.como.inj1)
+metab.bayes.clear.july.predict<- predict_metab(metab.bayes.clear.july)
 
 
 #############################
 ######SAVE PREDICTIONS#######
 #############################
-save(metab.bayes.como.inj1.predict,
-     file='C:/Users/keman/Dropbox/Documents/Courses/Metabolism ECO 592/Metabolizer/output/metab.bayes.como.inj1.predict.Rdata')
+save(metab.bayes.clear.july.predict,
+     file='data/out/metab.bayes.clear.july.predict.Rdata')
     #Change directory so it saves somewhere logical on your computer
     #then transfer the file to our Google Drive
     #https://drive.google.com/drive/folders/1M0T0WeHCMOPoGOWABq4ZQPhBw-B9srlN?usp=sharing
 
 #Take a glance at the predictions
-plot_metab_preds(metab.bayes.como.inj1.predict)
+plot_metab_preds(metab.bayes.clear.july.predict)
 
 
 ###INSPECT: Inspect more of the fitted daily parameters,
 #including K600, with get_params():
-metab.bayes.como.inj1.params<- get_params(metab.bayes.como.inj1)
+metab.bayes.clear.july.params<- get_params(metab.bayes.clear.july)
 
 #############################
 ######SAVE PARAMETERS########
 #############################
-save(metab.bayes.como.inj1.params,file='C:/Users/keman/Dropbox/Documents/Courses/Metabolism ECO 592/Metabolizer/output/metab.bayes.como.inj1.params.Rdata' )
+save(metab.bayes.clear.july.params,file='data/out/metab.bayes.clear.july.params.Rdata' )
     #Change directory so it saves somewhere logical on your computer
     #then transfer the file to our Google Drive
     #https://drive.google.com/drive/folders/1M0T0WeHCMOPoGOWABq4ZQPhBw-B9srlN?usp=sharing
@@ -192,118 +253,16 @@ save(metab.bayes.como.inj1.params,file='C:/Users/keman/Dropbox/Documents/Courses
 #Change the object names to be consistent with what you created above.
 
 #Plots the daily K600 values
-ggplot(metab.bayes.como.inj1.params,aes(date, K600.daily))+
+ggplot(metab.bayes.clear.july.params,aes(date, K600.daily))+
   geom_point(size=3)+
   geom_line(size=2)
 
 #And here are the dissolved oxygen predictions in a figure:
-plot_DO_preds(metab.bayes.como.inj1)
+plot_DO_preds(metab.bayes.clear.july)
 # 
-# ###BAYESIAN MODELS ONLY: you can dig even deeper using get_mcmc,
-# #which returns a stanfit object that can be inspected using the rstan package.
-# mcmc <- get_mcmc(metab.bayes.mc2.inflow.july2018)
-# rstan::traceplot(mcmc, pars='K600_daily', nrow=3)
-# 
-# ###OVERALL FIT: The get_fit() function returns a list of data.frames,
-# # one per temporal resolution, containing all fitted values and details
-# # about their distributions and convergence. Here are just the overall
-# # metrics of model convergence (Rhats, or potential scale reduction statistics;
-# # see Gelman and Rubin 1992 or Brooks and Gelman 1998):
-# get_fit(metab.bayes.mc2.inflow.july2018)$overall %>%
-#   select(ends_with('Rhat'))
-# 
-# #Here is a list of all column names available through get_fit()
-# get_fit(metab.bayes.mc2.inflow.july2018) %>%
-#   lapply(names)
-
-```
-
-#Sample: MC3 - outflow
-```{r}
-
-#The following chunk of code filters DO.final_all to only include NSV_MC3 (outflow), 
-#removes any NAs, and selects July 2018 for the range of dates.
-#Here, you need to change the site name and object name according to your assignment
-#Karin, Allie, Jemma = MC2 (inflow)
-#Bella, Caitlin, Tim = MC3 (outflow)
-
-DO.final.MC3<- DO.final_all%>%
-  filter(loc_site=='NSV_MC3')%>% select(-loc_site)%>%
-  filter(!is.na(solar.time))%>%
-  arrange(solar.time)%>%
-  distinct()%>%
-  #filter(year(solar.time) != 2017)%>%
-  filter(date(solar.time) > mdy('7/1/18') & date(solar.time) < mdy('7/31/18'))
-
-
-### IDENTIFY the name of the model structure you want using
-#Here,  change 'type' to the model type you are using (mle, night, bayes)
-#Then change the object name accordingly: e.g., MODELTYPE_name
-bayes_name <- mm_name(type='bayes', pool_K600='normal', err_obs_iid=TRUE, err_proc_iid=TRUE)
-
-### SPECIFICATIONS: We now pass the model name to specs() to get a list of default #specifications for this model.
-#Don't change parameters, but change the object name accordingly: e.g., MODELTYPE_specs
-bayes_specs <- specs(bayes_name, burnin_steps=2000, saved_steps=1000, n_cores=1, GPP_daily_mu=3, GPP_daily_sigma=2)
-
-
-#############################
-##########FIT MODEL##########
-#############################
-#Took 13 minutes on my machine with just a week of data.
-#Change spec type and make sure data type is correct.
-#Change name: e.g., metab.MODEL.SITECODE.SITENAME.DATES
-metab.bayes.mc3.outflow.july2018 <- metab(bayes_specs, data=DO.final.MC3)
-
-#NOTE:  Once you’ve fit a model, you can inspect the output with functions
-#including predict_metab() and plot_metab_preds(), predict_DO()
-#and plot_DO_preds(), get_params(), and get_fit().
-
-###PREDICTIONS: Here are the daily metabolism predictions from the model:
-metab.bayes.mc3.outflow.july2018.predict<- predict_metab(metab.bayes.mc3.outflow.july2018)
-
-
-#############################
-######SAVE PREDICTIONS#######
-#############################
-save(metab.bayes.mc3.outflow.july2018.predict,
-     file='data/output/metab.bayes.mc3.outflow.july2018.predict.Rdata')
-    #Change directory so it saves somewhere logical on your computer
-    #then transfer the file to our Google Drive
-    #https://drive.google.com/drive/folders/1M0T0WeHCMOPoGOWABq4ZQPhBw-B9srlN?usp=sharing
-
-#Take a glance at the predictions
-plot_metab_preds(metab.mle.mc3.outflow.july2018.predict)
-
-
-###INSPECT: Inspect more of the fitted daily parameters,
-#including K600, with get_params():
-metab.bayes.mc3.outflow.july2018.params<- get_params(metab.bayes.mc3.outflow.july2018)
-
-#############################
-######SAVE PARAMETERS########
-#############################
-save(metab.bayes.mc3.outflow.july2018.params,file='data/output/metab.bayes.mc3.outflow.july2018.params.Rdata')
-    #Change directory so it saves somewhere logical on your computer
-    #then transfer the file to our Google Drive
-    #https://drive.google.com/drive/folders/1M0T0WeHCMOPoGOWABq4ZQPhBw-B9srlN?usp=sharing
-
-
-#############################
-######EXTRA FEATURES#########
-#############################
-#Change the object names to be consistent with what you created above.
-
-#Plots the daily K600 values
-ggplot(metab.mle.mc3.outflow.july2018.params,aes(date, K600.daily))+
-  geom_point(size=3)+
-  geom_line(size=2)
-
-#And here are the dissolved oxygen predictions in a figure:
-plot_DO_preds(metab.mle.mc3.outflow.july2018)
-
 ###BAYESIAN MODELS ONLY: you can dig even deeper using get_mcmc,
 #which returns a stanfit object that can be inspected using the rstan package.
-mcmc <- get_mcmc(metab.bayes.mc3.outflow.july2018)
+mcmc <- get_mcmc(metab.bayes.clear.july)
 rstan::traceplot(mcmc, pars='K600_daily', nrow=3)
 
 ###OVERALL FIT: The get_fit() function returns a list of data.frames,
@@ -311,13 +270,14 @@ rstan::traceplot(mcmc, pars='K600_daily', nrow=3)
 # about their distributions and convergence. Here are just the overall
 # metrics of model convergence (Rhats, or potential scale reduction statistics;
 # see Gelman and Rubin 1992 or Brooks and Gelman 1998):
-get_fit(metab.bayes.mc3.outflow.july2018)$overall %>%
+get_fit(metab.bayes.clear.july)$overall %>%
   select(ends_with('Rhat'))
 
 #Here is a list of all column names available through get_fit()
-get_fit(metab.bayes.mc3.outflow.july2018) %>%
+get_fit(metab.bayes.clear.july) %>%
   lapply(names)
 
 ```
+
 
 
