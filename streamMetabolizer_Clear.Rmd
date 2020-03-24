@@ -1,7 +1,7 @@
 ---
 title: "StreamMetabolizer_Clear"
 author: "Alex Brooks, modified by Isabella Oleksy and Karin Emanuelson"
-date: "April 4, 2019"
+date: "March 23, 2020"
 output:
   pdf_document: default
   html_document: default
@@ -20,6 +20,10 @@ library(ggthemes)
 library(dygraphs)
 library(xts)
 library(unitted)
+library(grid)
+library(gridExtra)
+library(zoo)
+library(imputeTS)
 
 ?mm_data
 ## ^^ Information on how to prep your data, including what units.
@@ -39,11 +43,25 @@ Data.raw<- read_csv('data/in/CR1000_CZO4_1454_PB3_Data_Turb_Lvl_CDOM_CleanR.csv'
   ##you'll need to change directory specific to your computer
   mutate(UTC= mdy_hms(UTC, tz='UTC'))%>%
   mutate(datetime= mdy_hms(datetime, tz='CST6cDT'))%>%
-  mutate(depth = PT_depth_adj*.01)%>%
+  mutate(depth = PT_depth_adj*.01)%>% #convert from cm to m
   mutate(discharge = discharge/1000)%>%
   # select data from Continuous dataset
   select(datetime, UTC, DO.obs=DO_Conc, DO.per=DO_Per, temp.water=WTemp,depth, discharge, qal = Q)%>%
   filter(!is.na(DO.obs))
+
+# checkTimeSteps()
+timestep1<- Data.raw$datetime[2] - Data.raw$datetime[1]
+
+##round datetime to nearest whole timestep
+Data.raw$datetime[1:length(Data.raw$datetime)]<-
+     round_date(Data.raw$datetime[1:length(Data.raw$datetime)], '10 minutes')
+
+ts <- seq.POSIXt(Data.raw$datetime[1], Data.raw$datetime[length(Data.raw$datetime)], by=timestep1)
+fulltime<- data.frame(datetime=ts)
+#Create Dataframe with rows for missing data
+RAW2 <- full_join(fulltime,Data.raw)
+
+Data.raw2 <- na_interpolation(RAW2, option = "linear", maxgap = Inf)
 
 #Load light data from 850
 Light.raw<-read_csv('data/in/20363875_PAR_850.csv', skip = 1)%>%
@@ -58,10 +76,22 @@ Press.raw<-read_csv('data/in/20341764_baro.csv', skip = 1)%>%
   select(datetime, pressure.air)
          
 #Merge data into one file
-raw1<-left_join(Data.raw, Light.raw, by= "datetime")
+raw1<-left_join(Data.raw2, Light.raw, by= "datetime")
 DO.raw<-left_join(raw1, Press.raw, by= "datetime")
 
 
+
+#identify missing timesteps:
+missDatetime <- filter(DO.raw, is.na(DO.obs))$datetime
+
+# missingData<- RAW3%>%
+#   filter(is.na(DO.obs))
+
+length(missDatetime)
+```
+
+
+```{r}
 #Need to Calculate Percent Saturation 
 DO.raw$DO.sat<-calc_DO_sat(temp.water=u(DO.raw$temp.water,"degC"), pressure.air=u(DO.raw$pressure.air, "mb"), salinity.water = u(0, "PSU"), model = "garcia-benson")
 
@@ -71,9 +101,9 @@ DO.raw<-DO.raw%>%
   mutate(date= date(datetime))
 
 #Plot DO.per from miniDOT to calculated DO.Per from DO.sat
-# ggplot(DO.raw,aes(x=DO.per,y=as.numeric(DO.per2))) + 
+# ggplot(DO.raw,aes(x=DO.per,y=as.numeric(DO.per2))) +
 #   geom_point()+
-#   theme_few() + 
+#   theme_few() +
 #   scale_color_few() +
 #   theme(legend.position=c(0.2,0.8))
 #Look at structure of the data
@@ -84,15 +114,46 @@ DO.raw<-DO.raw%>%
 ```{r}
 #Using functions provided with streamMetabolizer package
 #to calculate solar time
+tz(DO.raw$datetime)
 
 DO.final<- DO.raw%>%
   mutate(solartime= calc_solar_time(datetime,longitude = -91.948889))%>%
-  mutate(solar.time= ymd_hms(solartime, tz='CST6CDT'))%>%
+  mutate(solar.time= force_tz(solartime, tz='CST6CDT'))%>%
+  # mutate(solar.time= ymd_hms(solartime, tz='CST6CDT'))%>%
   # mutate(depth = as.numeric(CorrStage))%>%
   # mutate(discharge = as.numeric(Discharge))%>%
-  select(solar.time, date, DO.obs,DO.sat,depth,temp.water,light, discharge)
+  select(solartime, solar.time, datetime, date, DO.obs,DO.sat,depth,temp.water,light, discharge)
 
+tz(DO.final$solar.time)
+tz(DO.final$solartime)
 ```
+
+# Graph things to see if they make sense
+```{r}
+DO.graph<- DO.final%>%
+  filter(date(solar.time) > mdy('7/2/19') & date(solar.time) < mdy('7/17/19'))
+
+g1<- ggplot(DO.graph,aes(x=solar.time,y=DO.obs)) +
+  geom_point()+
+  theme_few()
+
+g2<- ggplot(DO.graph,aes(x=solar.time,y=temp.water)) +
+  geom_point()+
+  theme_few()
+
+g3<- ggplot(DO.graph,aes(x=datetime,y=DO.obs)) +
+  geom_point()+
+  theme_few()
+
+g4<- ggplot(DO.graph,aes(x=datetime,y=temp.water)) +
+  geom_point()+
+  theme_few()
+
+grid.arrange(g1, g2, g3, g4, ncol=1, nrow =4)
+
+DO.final<-select(DO.final, -datetime)
+```
+
 
 #Model light in order to fill in missing PAR values
 ```{r}
@@ -110,49 +171,55 @@ mean(Max_light$daily_max)
 #Use built in function to calculate model light for each day (in which data was not collected), Need to trick calc_light function into thinking time is UTC
 stime<-DO.final%>%
     filter(is.na(light))%>%
-    mutate(solar.time= ymd_hms(solar.time, tz='UTC'))%>%
-    select(solar.time)
+    # mutate(solar.time= ymd_hms(solar.time, tz='UTC'))%>%
+    select(solartime)
 
-tz(stime$solar.time)
+tz(stime$solartime)
 
-light<-calc_light(stime$solar.time, 41.734982, -91.948889, max.PAR= u(4066.921, "umol m^-2 s^-1"))
+light<-calc_light(stime$solartime, 41.734982, -91.948889, max.PAR= u(4066.921, "umol m^-2 s^-1"))
 
-added_light<-data.frame(stime$solar.time, light)
-tz(added_light$stime.solar.time)
+added_light<-data.frame(stime$solartime, light)
+tz(added_light$stime.solartime)
 
 added_light_C<-added_light%>%
-  mutate(solar.time= ymd_hms(stime.solar.time, tz='CST6CDT'))%>%
-  select(solar.time,light)
+  mutate(solartime= force_tz(stime.solartime, tz='CST6CDT'))%>%
+  select(solartime,light)
 
-tz(added_light_C$solar.time)
+tz(added_light_C$solartime)
+
+
 
 #graph modelled light
 #just look at 
-light_mod.xts<- xts(select(added_light_C, light), order.by = added_light_C$solar.time)
+light_mod.xts<- xts(select(added_light_C, light), order.by = added_light_C$solartime)
 
 
-# #plot as dygraph
-dygraph(light_mod.xts)%>%
-          dyRangeSelector()
-##### ISSUE! Light begins at the correct time but it does not end at the correct time Check Sunrise/Sunset here: https://www.timeanddate.com/sun/@4862040
+# # #plot as dygraph
+# dygraph(light_mod.xts)%>%
+#           dyRangeSelector()
 
 # merge modelled light data into DO.final dataframe then create light with continuous dataset
-DO.final.merge<-left_join(DO.final, added_light_C, by= "solar.time")
+DO.final.merge<-left_join(DO.final, added_light_C, by= "solartime")
 
 DO.final.all<-DO.final.merge%>%
   mutate(light=ifelse(is.na(light.x),light.y, light.x))
 
+ggplot(DO.final.all, aes(x=solartime, y=light))+
+  geom_point()+
+  theme_few()
+
 ```
 
 ```{r}
-#just look at 
-RAWALL.xts<- xts(select(DO.final.all, light, temp.water, DO.obs, DO.sat), order.by = DO.final$solar.time)
+# #just look at 
+# RAWALL.xts<- xts(select(DO.final.all, light, temp.water, DO.obs, DO.sat), order.by = DO.final$solartime)
+# 
+# # #plot as dygraph
+# dygraph(RAWALL.xts)%>%
+#           dyRangeSelector()
 
-# #plot as dygraph
-dygraph(RAWALL.xts)%>%
-          dyRangeSelector()
+DO.final<-select(DO.final.all, solartime, date, DO.obs, DO.sat, depth, temp.water, discharge, light)
 
-DO.final<-select(DO.final.all, solar.time, date, DO.obs, DO.sat, depth, temp.water, discharge, light)
 
 write.csv(DO.final, file = 'C:/Users/keman/Dropbox/NSF Hydro Sci NM CO/Clear Creek 2019/CSU Crew/Dataloggers/Continuous/CZO4_DO_for_input.csv')
 ```
@@ -165,24 +232,32 @@ write.csv(DO.final, file = 'C:/Users/keman/Dropbox/NSF Hydro Sci NM CO/Clear Cre
 
 #The following chunk of code filters DO.final_all 
 #removes any NAs, and selects July 2019 for the range of dates.
+tz(DO.final$solar.time)
+
+# Read in previous Data
+# DO.read<-read_csv('data/in/CZO4_DO_for_input.csv')
+# DO.final<-DO.read%>%
+#   select(solar.time, date, DO.obs, DO.sat, depth, temp.water, discharge, light)%>%
+#   mutate(solartime = as.POSIXct(solar.time, tz = 'UTC', format = "%y%m%d %H:%M:%S"))
 
 DO.final_1<- DO.final%>%
   filter(!is.na(depth))%>%
-  filter(!is.na(solar.time))%>%
-  arrange(solar.time)%>%
-  mutate(solar.time= ymd_hms(solar.time, tz='UTC'))%>%
-  distinct()%>%
+  filter(!is.na(solartime))%>%
   select(-date)%>%
+  rename(solar.time = solartime)%>%
+  arrange(solar.time)%>%
+  distinct()
+
   #filter(year(solar.time) != 2017)%>%
-  filter(date(solar.time) > mdy('7/2/19') & date(solar.time) < mdy('7/17/19'))
+  # filter(date(solar.time) > mdy('7/2/19') & date(solar.time) < mdy('7/17/19'))
 #Plot
-ggplot(DO.final_1,aes(x=solar.time, y=light))+
+ggplot(DO.final_1, aes(x=solar.time, y=light))+
   geom_point(size=3)+
   geom_line(size=2)
 # DO.raw<- DO.raw%>%
 
 
-#Get time zone attribute
+#Get time zone attribute should say UTC but it is actually CDT
 attr(DO.final_1$solar.time, "tzone")
 
 ######################################
@@ -196,7 +271,7 @@ bayes_name <- mm_name(type='bayes', pool_K600='binned', err_obs_iid=TRUE, err_pr
 
 ### SPECIFICATIONS: We now pass the model name to specs() to get a list of default #specifications for this model.
 #Don't change parameters, but change the object name accordingly: e.g., MODELTYPE_specs
-bayes_specs <- streamMetabolizer::specs(bayes_name, burnin_steps=200, saved_steps=100, n_cores=1)
+bayes_specs <- streamMetabolizer::specs(bayes_name, burnin_steps=200, saved_steps=100, n_cores=2)
 
 
 #############################
@@ -218,30 +293,30 @@ metab.bayes.clear.july
 #and plot_DO_preds(), get_params(), and get_fit().
 
 ###PREDICTIONS: Here are the daily metabolism predictions from the model:
-metab.bayes.clear.july.predict<- predict_metab(metab.bayes.clear.july)
+metab.bayes.clear.predict<- predict_metab(metab.bayes.clear.july)
 
 
 #############################
 ######SAVE PREDICTIONS#######
 #############################
-save(metab.bayes.clear.july.predict,
-     file='data/out/metab.bayes.clear.july.predict.Rdata')
+save(metab.bayes.clear.predict,
+     file='data/out/metab.bayes.clear.predict.Rdata')
     #Change directory so it saves somewhere logical on your computer
     #then transfer the file to our Google Drive
     #https://drive.google.com/drive/folders/1M0T0WeHCMOPoGOWABq4ZQPhBw-B9srlN?usp=sharing
 
 #Take a glance at the predictions
-plot_metab_preds(metab.bayes.clear.july.predict)
+plot_metab_preds(metab.bayes.clear.predict)
 
 
 ###INSPECT: Inspect more of the fitted daily parameters,
 #including K600, with get_params():
-metab.bayes.clear.july.params<- get_params(metab.bayes.clear.july)
+metab.bayes.clear.params<- get_params(metab.bayes.clear.july)
 
 #############################
 ######SAVE PARAMETERS########
 #############################
-save(metab.bayes.clear.july.params,file='data/out/metab.bayes.clear.july.params.Rdata' )
+save(metab.bayes.clear.params,file='data/out/metab.bayes.clear.params.Rdata' )
     #Change directory so it saves somewhere logical on your computer
     #then transfer the file to our Google Drive
     #https://drive.google.com/drive/folders/1M0T0WeHCMOPoGOWABq4ZQPhBw-B9srlN?usp=sharing
@@ -253,7 +328,7 @@ save(metab.bayes.clear.july.params,file='data/out/metab.bayes.clear.july.params.
 #Change the object names to be consistent with what you created above.
 
 #Plots the daily K600 values
-ggplot(metab.bayes.clear.july.params,aes(date, K600.daily))+
+ggplot(metab.bayes.clear.params,aes(date, K600.daily))+
   geom_point(size=3)+
   geom_line(size=2)
 
@@ -273,11 +348,62 @@ rstan::traceplot(mcmc, pars='K600_daily', nrow=3)
 get_fit(metab.bayes.clear.july)$overall %>%
   select(ends_with('Rhat'))
 
+select(get_params(metab.bayes.clear.july), warnings, errors)
+
 #Here is a list of all column names available through get_fit()
 get_fit(metab.bayes.clear.july) %>%
   lapply(names)
 
 ```
 
+## Read in Data from previous model run and graph
+```{r}
+params<- load(file='data/out/metab.bayes.clear.params.Rdata')
+
+predict<- load(file='data/out/metab.bayes.clear.predict.Rdata')
+
+# load CO2 file by name
+file<- 'C:/Users/keman/Dropbox/NSF Hydro Sci NM CO/Clear Creek 2019/CSU Crew/Dataloggers/Continuous/CR1000_CZO3_1459_PB4_Data_Turb_Lvl_CDOM_CleanR.csv'
+
+CO2<-read.csv(file)[,2:29]%>%
+      mutate(datetime= mdy_hms(datetime,tz='CST6CDT'))%>%
+    mutate(solartime= calc_solar_time(datetime,longitude = -91.948889))%>%
+  mutate(solartime= ymd_hms(solartime, tz='CST6CDT'))%>%
+  select(solartime, CO2_aq_ppm)
+
+Graph<-left_join(DO.final, CO2, by= 'solartime')
+
+#Plots the daily K600 values
+k<-ggplot(metab.bayes.clear.params,aes(date, K600.daily))+
+  geom_point(size=2)+
+  geom_line(size=1)
+
+#Plots the daily GPP prediction values
+g<-ggplot(metab.bayes.clear.predict,aes(date, GPP))+
+  geom_point(size=2)+
+  geom_errorbar(aes(ymax=GPP.upper, ymin = GPP.lower))+
+  geom_line(size=1)
+
+#Plots the daily ER prediction values
+e<-ggplot(metab.bayes.clear.predict,aes(date, ER))+
+  geom_point(size=2)+
+  geom_errorbar(aes(ymax=ER.upper, ymin = ER.lower))+
+  geom_line(size=1)
+
+
+# Plot discharge
+d<- ggplot(Graph, aes(solartime, discharge))+
+  geom_line(size=1)
+
+# Plot CO2 Data
+c<- ggplot(Graph, aes(solartime, CO2_aq_ppm))+
+  geom_line(size=1)
+
+#Model Outputs
+grid.arrange(g, e, k, ncol=1, nrow =3)
+
+#Metabolism Parameters
+grid.arrange(g, e, c, d, ncol=1, nrow =4)
+```
 
 
